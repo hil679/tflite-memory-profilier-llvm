@@ -54,8 +54,9 @@ PreservedAnalyses TfliteProfilerPass::run(Function& F,
 	// IR에 삽입할 로깅 함수 선언
 	LLVMContext& Ctx = F.getContext();
 	Module* module = F.getParent();
+
 	FunctionCallee logFunc = module->getOrInsertFunction(
-			"log_mem_access", Type::getVoidTy(Ctx), Type::getInt8Ty(Ctx),
+			"logMemAccess", Type::getVoidTy(Ctx), Type::getInt8Ty(Ctx),
 			Type::getInt32Ty(Ctx));
 
 	bool modified = false;
