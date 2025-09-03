@@ -13,10 +13,13 @@
 #include "header/TfliteMemoryProfiler.h"
 using namespace llvm;
 
+#include "llvm/Passes/OptimizationLevel.h"
+
 // 메모리 접근 유형을 구분
 enum AccessType {
-  INPUT = 0,
-  OUTPUT = 1,
+  LOAD = 0,
+  STORE = 1,
+  ALLOC_STACK = 2
 };
 
 // 포인터의 베이스 포인터을 찾음
@@ -30,68 +33,56 @@ Value* tracePointerOrigin(Value* Ptr) {
 }
 
 
-PreservedAnalyses TfliteProfilerPass::run(Function& F, 
-	FunctionAnalysisManager & FAM) {
-	StringRef functionName = F.getName();
-	if (!functionName.contains("FullyConnected")) {
-		return PreservedAnalyses::all();
-	}
+PreservedAnalyses TfliteProfilerPass::run(Module& M, 
+	ModuleAnalysisManager & MAM) {
 
-	// 함수의 인자 저장
-	SmallVector<Argument*, 8> Args;
-	for (auto& Arg : F.args()) {
-		Args.push_back(&Arg);
-	}
+	LLVMContext& Context = M.getContext();
+        const DataLayout &Layout = M.getDataLayout();
 
-	// 함수 시그니처와 맞는지 확인 가능 시 일반화 코드로 변경 필요
-	// float인 경우에 대해서만 test code
-	if (Args.size() != 9)
-			return PreservedAnalyses::all();
-	
-	Argument* input_data_arg = Args[2];  
-	Argument* output_data_arg = Args[8]; 
+        std::vector<Type*> ArgTys;
+        ArgTys.push_back(llvm::PointerType::get(Type::getInt8Ty(Context), 0));
+        ArgTys.push_back(Type::getInt32Ty(Context));
+        //ArgTys.push_back(M.getDataLayout().getIntPtrType(Context));         // size_t (load 크기)
+        FunctionType* traceFuncTy = FunctionType::get(
+        	Type::getVoidTy(Context), ArgTys, /*isVarArg=*/false);
 
-	// IR에 삽입할 로깅 함수 선언
-	LLVMContext& Ctx = F.getContext();
-	Module* module = F.getParent();
+	FunctionCallee logFunc = M.getOrInsertFunction(
+			"logMemAccess",
+			traceFuncTy);
 
-	FunctionCallee logFunc = module->getOrInsertFunction(
-			"logMemAccess", Type::getVoidTy(Ctx), Type::getInt8Ty(Ctx),
-			Type::getInt32Ty(Ctx));
+	for (Function& F : M) {
+        StringRef N = F.getName();
+        if (N == "logMemAccess") {
+            errs() << "[Profiler] skipping instrumentation of " << F.getName() << "\n";
+            continue;
+        }
+        if (N.contains("PrintAllocations") ||
+            N.contains("LogTicksPerTagCsv") ||
+            N.contains("RecordingMicroAllocator") ||
+            N.contains("MicroProfiler") ||
+            N.contains("Profiler"))
+          continue;
+		for (auto& BB : F) {
+			for (auto& I : BB) {
+				if (LoadInst* loadInst = dyn_cast<LoadInst>(&I)) {
+                    IRBuilder<> builder(loadInst);
 
-	bool modified = false;
+					Value* accessPtr = loadInst->getPointerOperand();
+                    Value* address = builder.CreateBitCast(accessPtr, llvm::PointerType::get(Type::getInt8Ty(Context), 0));
+					Value* origin = tracePointerOrigin(accessPtr);
+                    Value* type = ConstantInt::get(Type::getInt32Ty(Context), LOAD);
 
-	for (auto& BB : F) {
-		for (auto& I : BB) {
-			Value* accessPtr = nullptr;
-			Argument* originArg = nullptr;
-			AccessType accessType;
+					builder.CreateCall(logFunc, {address, type /*, loadedSize */});
+				} else if (StoreInst* storeInst = dyn_cast<StoreInst>(&I)) {
+                    IRBuilder<> builder(storeInst);
 
-			if (LoadInst* loadInst = dyn_cast<LoadInst>(&I)) {
-				// Load 명령어의 경우, input_data에서의 읽기인지 확인
-				accessPtr = loadInst->getPointerOperand();
-				Value* origin = tracePointerOrigin(accessPtr);
-				if (origin == input_data_arg) {
-					originArg = input_data_arg;
-					accessType = INPUT;
+					Value* accessPtr = storeInst->getPointerOperand();
+                    Value* address = builder.CreateBitCast(accessPtr, llvm::PointerType::get(Type::getInt8Ty(Context), 0));
+					Value* origin = tracePointerOrigin(accessPtr);
+                    Value* type = ConstantInt::get(Type::getInt32Ty(Context), STORE);
+
+                    builder.CreateCall(logFunc, {address, type});
 				}
-			} else if (StoreInst* storeInst = dyn_cast<StoreInst>(&I)) {
-				// Store 명령어의 경우, output_data에 대한 쓰기인지 확인
-				accessPtr = storeInst->getPointerOperand();
-				Value* origin = tracePointerOrigin(accessPtr);
-				if (origin == output_data_arg) {
-					originArg = output_data_arg;
-					accessType = OUTPUT;
-				}
-			}
-
-			// 타겟 포인터에 대한 접근일 경우, 로깅 함수 호출 코드 삽입
-			if (originArg) {
-				IRBuilder<> builder(&I);
-				Value* address = builder.CreateBitCast(accessPtr, llvm::PointerType::get(Type::getInt8Ty(Ctx), 0));
-				Value* type = ConstantInt::get(Type::getInt32Ty(Ctx), accessType);
-				builder.CreateCall(logFunc, {address, type});
-				modified = true;
 			}
 		}
 	}
@@ -104,21 +95,32 @@ PreservedAnalyses TfliteProfilerPass::run(Function& F,
 extern "C" PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {
         LLVM_PLUGIN_API_VERSION,
-        "MemoryProfilerPassPlugin",
+        "TfliteProfilerPassPlugin",
         LLVM_VERSION_STRING,
         [](PassBuilder &PB) {
             dbgs() << "[DEBUG] Registering MemoryProfiler Pass";
-            PB.registerPipelineParsingCallback(
-                [](const StringRef name, FunctionPassManager& FPM,
-                    ArrayRef<PassBuilder::PipelineElement>) {
-                        if (name == "tflite-memory-profiler") {
-                            FPM.addPass(TfliteProfilerPass());
-                            return true;
-                        } else {
-                            return false;
-                        }
-                    }
-            );
+//            PB.registerPipelineParsingCallback(
+//                [](const StringRef name, ModulePassManager& MPM,
+//                    ArrayRef<PassBuilder::PipelineElement> Pipeline) {
+//                        if (name == "tflite-memory-profiler") {
+//                            MPM.addPass(TfliteProfilerPass());
+//                            return true;
+//                        } else {
+//                            return false;
+//                        }
+//                    }
+//            );
+//            PB.registerPipelineStartEPCallback(
+//            [&](ModulePassManager &MPM, OptimizationLevel level) {
+//              MPM.addPass(TfliteProfilerPass());
+//              dbgs() << "[DEBUG] Inserted TfliteProfilerPass at pipeline start\n";
+//            });
+            PB.registerOptimizerLastEPCallback(
+            [&](ModulePassManager &MPM,
+                OptimizationLevel Level,
+                ThinOrFullLTOPhase Phase) {
+              MPM.addPass(TfliteProfilerPass());
+            });
         }
     };
 }
